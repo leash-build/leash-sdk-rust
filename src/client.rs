@@ -92,6 +92,13 @@ impl LeashIntegrations {
         action: &str,
         body: Option<serde_json::Value>,
     ) -> Result<serde_json::Value, LeashError> {
+        if self.api_key.is_none() {
+            return Err(LeashError::ApiError {
+                message: "API key required. Create one with `leash keys create <app-name>` or in your app settings at leash.build".into(),
+                code: Some("api_key_required".into()),
+            });
+        }
+
         let url = format!(
             "{}/api/integrations/{}/{}",
             self.platform_url, provider, action
