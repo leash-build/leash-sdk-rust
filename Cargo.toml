@@ -3,7 +3,7 @@ name = "leash-sdk"
 version = "0.1.0"
 edition = "2021"
 description = "Rust SDK for the Leash platform integrations API"
-license = "MIT"
+license = "Apache-2.0"
 repository = "https://github.com/leash-build/leash-sdk-rust"
 keywords = ["leash", "integrations", "gmail", "calendar", "drive"]
 
