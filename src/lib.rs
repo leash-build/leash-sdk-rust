@@ -28,12 +28,14 @@
 
 pub mod calendar;
 pub mod client;
+pub mod custom;
 pub mod drive;
 pub mod gmail;
 pub mod types;
 
 // Re-exports for convenience.
 pub use client::LeashIntegrations;
+pub use custom::CustomIntegration;
 pub use types::{
     Attendee, ConnectionStatus, CreateEventParams, EventDateTime, LeashError, ListEventsParams,
     ListFilesParams, ListMessagesParams, SendMessageParams, DEFAULT_PLATFORM_URL,

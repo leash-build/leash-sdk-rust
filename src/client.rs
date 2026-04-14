@@ -1,4 +1,5 @@
 use crate::calendar::CalendarClient;
+use crate::custom::CustomIntegration;
 use crate::drive::DriveClient;
 use crate::gmail::GmailClient;
 use crate::types::{ApiResponse, ConnectionStatus, LeashError, DEFAULT_PLATFORM_URL};
@@ -70,6 +71,14 @@ impl LeashIntegrations {
     /// Return a [`DriveClient`] for interacting with the Google Drive integration.
     pub fn drive(&self) -> DriveClient<'_> {
         DriveClient { client: self }
+    }
+
+    /// Return a [`CustomIntegration`] for the given integration name.
+    ///
+    /// This is the escape hatch for custom or untyped integrations that don't
+    /// have dedicated provider clients.
+    pub fn integration(&self, name: &str) -> CustomIntegration<'_> {
+        CustomIntegration::new(name, self)
     }
 
     /// Perform a generic integration API call.
