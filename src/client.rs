@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::sync::Mutex;
+
 use crate::calendar::CalendarClient;
 use crate::custom::CustomIntegration;
 use crate::drive::DriveClient;
@@ -25,6 +28,7 @@ pub struct LeashIntegrations {
     pub(crate) auth_token: String,
     pub(crate) api_key: Option<String>,
     pub(crate) http: reqwest::Client,
+    env_cache: Mutex<Option<HashMap<String, String>>>,
 }
 
 impl LeashIntegrations {
@@ -35,6 +39,7 @@ impl LeashIntegrations {
             auth_token: auth_token.into(),
             api_key: std::env::var("LEASH_API_KEY").ok(),
             http: reqwest::Client::new(),
+            env_cache: Mutex::new(None),
         }
     }
 
@@ -168,6 +173,101 @@ impl LeashIntegrations {
             })?;
 
         Ok(connections)
+    }
+
+    /// Call any MCP server tool directly via the Leash platform.
+    ///
+    /// Sends `POST {platform_url}/api/mcp/run` with the given npm package name,
+    /// tool name, and optional arguments, then returns the `data` field.
+    pub async fn mcp(
+        &self,
+        package: &str,
+        tool: &str,
+        args: serde_json::Value,
+    ) -> Result<serde_json::Value, LeashError> {
+        let url = format!("{}/api/mcp/run", self.platform_url);
+
+        let payload = serde_json::json!({
+            "package": package,
+            "tool": tool,
+            "args": args,
+        });
+
+        let mut req = self
+            .http
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .json(&payload);
+
+        if !self.auth_token.is_empty() {
+            req = req.bearer_auth(&self.auth_token);
+        }
+        if let Some(ref key) = self.api_key {
+            req = req.header("X-API-Key", key);
+        }
+
+        let resp = req.send().await?;
+        let api_resp: ApiResponse = resp.json().await?;
+
+        if !api_resp.success {
+            return Err(api_resp.into_error());
+        }
+
+        Ok(api_resp.data.unwrap_or(serde_json::Value::Null))
+    }
+
+    /// Fetch all environment variables from the Leash platform.
+    ///
+    /// The result is cached after the first successful call.
+    pub async fn get_env(&self) -> Result<HashMap<String, String>, LeashError> {
+        // Check cache first.
+        {
+            let cache = self.env_cache.lock().unwrap();
+            if let Some(ref cached) = *cache {
+                return Ok(cached.clone());
+            }
+        }
+
+        let url = format!("{}/api/apps/env", self.platform_url);
+
+        let mut req = self.http.get(&url);
+
+        if !self.auth_token.is_empty() {
+            req = req.bearer_auth(&self.auth_token);
+        }
+        if let Some(ref key) = self.api_key {
+            req = req.header("X-API-Key", key);
+        }
+
+        let resp = req.send().await?;
+        let api_resp: ApiResponse = resp.json().await?;
+
+        if !api_resp.success {
+            return Err(api_resp.into_error());
+        }
+
+        let data = api_resp.data.unwrap_or(serde_json::Value::Null);
+        let env_map: HashMap<String, String> =
+            serde_json::from_value(data).map_err(|e| LeashError::ApiError {
+                message: format!("failed to parse env data: {e}"),
+                code: None,
+            })?;
+
+        // Store in cache.
+        {
+            let mut cache = self.env_cache.lock().unwrap();
+            *cache = Some(env_map.clone());
+        }
+
+        Ok(env_map)
+    }
+
+    /// Fetch a single environment variable by key.
+    ///
+    /// Returns `None` if the key is not present.
+    pub async fn get_env_key(&self, key: &str) -> Result<Option<String>, LeashError> {
+        let env_map = self.get_env().await?;
+        Ok(env_map.get(key).cloned())
     }
 
     /// Get the URL to initiate an OAuth connection flow for the given provider.
