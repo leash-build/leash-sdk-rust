@@ -1,83 +1,61 @@
 # leash-sdk (Rust)
 
-Rust SDK for the [Leash](https://leash.build) platform integrations API.
+Rust SDK for Leash-hosted integrations.
+
+Use it to call provider actions through the Leash platform proxy instead of handling provider OAuth and token storage yourself.
 
 ## Installation
 
 ```toml
 [dependencies]
-leash-sdk = "0.1"
+leash-sdk = "0.2"
 tokio = { version = "1", features = ["full"] }
 ```
 
-## Quick start
+## Quick Start
 
 ```rust
-use leash_sdk::{LeashIntegrations, ListMessagesParams, SendMessageParams};
+use leash_sdk::LeashIntegrations;
 
 #[tokio::main]
 async fn main() -> Result<(), leash_sdk::LeashError> {
-    let client = LeashIntegrations::new("your-jwt-token")
+    let client = LeashIntegrations::new("your-platform-jwt")
         .with_platform_url("https://leash.build")
-        .with_api_key("optional-api-key");
+        .with_api_key("optional-app-api-key");
 
-    // Gmail
     let messages = client.gmail().list_messages(None).await?;
-    let labels = client.gmail().list_labels().await?;
-
-    // Calendar
-    let calendars = client.calendar().list_calendars().await?;
-    let events = client.calendar().list_events(None).await?;
-
-    // Drive
-    let files = client.drive().list_files(None).await?;
-
-    // Connections
     let connected = client.is_connected("gmail").await;
-    let connect_url = client.get_connect_url("gmail", Some("https://myapp.com/callback"));
+    let connect_url = client.get_connect_url("gmail", Some("https://myapp.example.com/settings"));
 
+    println!("connected: {}", connected);
+    println!("messages: {}", messages);
+    println!("connect url: {}", connect_url);
     Ok(())
 }
 ```
 
-## API
+## Default Platform URL
 
-### `LeashIntegrations`
+- `https://leash.build`
 
-| Method | Description |
-|--------|-------------|
-| `new(auth_token)` | Create client with default platform URL |
-| `with_platform_url(url)` | Set custom platform URL |
-| `with_api_key(key)` | Set API key for `X-API-Key` header |
-| `gmail()` | Get Gmail client |
-| `calendar()` | Get Calendar client |
-| `drive()` | Get Drive client |
-| `call(provider, action, body)` | Generic integration call |
-| `is_connected(provider_id)` | Check if a provider is connected |
-| `get_connections()` | Get all connection statuses |
-| `get_connect_url(provider_id, return_url)` | Get OAuth connect URL |
+## Features
 
-### Gmail
+- Gmail
+- Google Calendar
+- Google Drive
+- connection status lookup
+- connect URL generation
+- generic provider calls
+- custom integration calls
+- app env fetch and caching
+- MCP execution through the platform
 
-- `list_messages(params)` - List messages
-- `get_message(message_id, format)` - Get a message
-- `send_message(params)` - Send a message
-- `search_messages(query, max_results)` - Search messages
-- `list_labels()` - List labels
+## Notes
 
-### Calendar
-
-- `list_calendars()` - List calendars
-- `list_events(params)` - List events
-- `create_event(params)` - Create an event
-- `get_event(event_id, calendar_id)` - Get an event
-
-### Drive
-
-- `list_files(params)` - List files
-- `get_file(file_id)` - Get file metadata
-- `search_files(query, max_results)` - Search files
+- pass a valid Leash platform JWT as the auth token
+- use `with_api_key(...)` for app-scoped access when needed
+- provider OAuth remains a platform concern, not an SDK concern
 
 ## License
 
-MIT
+Apache-2.0
