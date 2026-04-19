@@ -50,6 +50,38 @@ async fn main() -> Result<(), leash_sdk::LeashError> {
 - app env fetch and caching
 - MCP execution through the platform
 
+## Server Auth
+
+The SDK includes framework-agnostic helpers for authenticating users on the
+server side by reading the `leash-auth` cookie set by the Leash platform.
+
+```rust
+use leash_sdk::{get_leash_user, is_authenticated};
+
+// In any handler that has access to the raw Cookie header:
+let user = leash_sdk::get_leash_user(cookie_header)?;
+println!("Hello, {}", user.name);
+
+// Or just check authentication:
+if leash_sdk::is_authenticated(cookie_header) {
+    // proceed
+}
+```
+
+If your framework has already parsed cookies, use the token directly:
+
+```rust
+let user = leash_sdk::get_leash_user_from_cookie(token)?;
+```
+
+## MCP Calls
+
+Execute MCP-backed tools through the platform:
+
+```rust
+let result = client.run_mcp("@some/mcp-package", "tool-name", serde_json::json!({"key": "value"})).await?;
+```
+
 ## Notes
 
 - pass a valid Leash platform JWT as the auth token
