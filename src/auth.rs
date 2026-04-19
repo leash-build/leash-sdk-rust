@@ -97,6 +97,21 @@ pub fn get_leash_user_from_cookie(token: &str) -> Result<LeashUser, LeashError> 
     Ok(LeashUser::from(claims))
 }
 
+/// Check whether the raw `Cookie` header contains a valid `leash-auth` token.
+///
+/// Returns `true` when [`get_leash_user`] would succeed, `false` otherwise.
+pub fn is_authenticated(cookie_header: &str) -> bool {
+    get_leash_user(cookie_header).is_ok()
+}
+
+/// Check whether a raw JWT token string represents a valid Leash session.
+///
+/// Returns `true` when [`get_leash_user_from_cookie`] would succeed, `false`
+/// otherwise.
+pub fn is_authenticated_from_cookie(token: &str) -> bool {
+    get_leash_user_from_cookie(token).is_ok()
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
@@ -299,6 +314,39 @@ mod tests {
         let user = get_leash_user_from_cookie(&token).unwrap();
         assert_eq!(user.id, "usr_456");
         assert_eq!(user.picture, None);
+    }
+
+    #[test]
+    fn is_authenticated_returns_true_for_valid_cookie() {
+        std::env::remove_var("LEASH_JWT_SECRET");
+
+        let claims = sample_claims();
+        let token = make_token(&claims, "any-secret");
+        let header = format!("leash-auth={token}");
+
+        assert!(is_authenticated(&header));
+    }
+
+    #[test]
+    fn is_authenticated_returns_false_for_missing_cookie() {
+        assert!(!is_authenticated("session=abc"));
+    }
+
+    #[test]
+    fn is_authenticated_from_cookie_returns_true_for_valid_token() {
+        std::env::remove_var("LEASH_JWT_SECRET");
+
+        let claims = sample_claims();
+        let token = make_token(&claims, "any-secret");
+
+        assert!(is_authenticated_from_cookie(&token));
+    }
+
+    #[test]
+    fn is_authenticated_from_cookie_returns_false_for_invalid_token() {
+        std::env::remove_var("LEASH_JWT_SECRET");
+
+        assert!(!is_authenticated_from_cookie("not-a-jwt"));
     }
 
     #[test]

@@ -35,7 +35,10 @@ pub mod gmail;
 pub mod types;
 
 // Re-exports for convenience.
-pub use auth::{get_leash_user, get_leash_user_from_cookie, LeashUser};
+pub use auth::{
+    get_leash_user, get_leash_user_from_cookie, is_authenticated, is_authenticated_from_cookie,
+    LeashUser,
+};
 pub use client::LeashIntegrations;
 pub use custom::CustomIntegration;
 pub use types::{
