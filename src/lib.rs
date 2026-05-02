@@ -42,6 +42,7 @@ pub use auth::{
 pub use client::LeashIntegrations;
 pub use custom::CustomIntegration;
 pub use types::{
-    Attendee, ConnectionStatus, CreateEventParams, EventDateTime, LeashError, ListEventsParams,
-    ListFilesParams, ListMessagesParams, SendMessageParams, DEFAULT_PLATFORM_URL,
+    Attendee, ConnectionStatus, CreateEventParams, CustomMcpServerConfig, EventDateTime,
+    LeashError, ListEventsParams, ListFilesParams, ListMessagesParams, SendMessageParams,
+    DEFAULT_PLATFORM_URL,
 };
