@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fmt;
 
 /// Default Leash platform URL.
@@ -109,6 +110,30 @@ pub struct ConnectionStatus {
     /// When the OAuth token expires, if available.
     #[serde(default, rename = "expiresAt")]
     pub expires_at: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Custom MCP server config (LEA-143)
+// ---------------------------------------------------------------------------
+
+/// Resolved config for a customer-registered MCP server.
+///
+/// Returned by [`LeashIntegrations::get_custom_mcp_config`](crate::LeashIntegrations::get_custom_mcp_config).
+/// Contains the customer's MCP URL plus any auth headers to attach (e.g. a
+/// resolved `Authorization: Bearer …` for bearer-auth servers) — feed this
+/// directly into your MCP client. Leash isn't on the MCP request path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CustomMcpServerConfig {
+    /// The MCP server slug (matches the path parameter).
+    pub slug: String,
+    /// Human-readable display name configured by the customer.
+    #[serde(rename = "displayName")]
+    pub display_name: String,
+    /// Customer's MCP endpoint URL.
+    pub url: String,
+    /// Headers to attach to every MCP request, including the resolved
+    /// `Authorization` header for bearer-auth servers.
+    pub headers: HashMap<String, String>,
 }
 
 // ---------------------------------------------------------------------------

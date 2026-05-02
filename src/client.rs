@@ -5,7 +5,9 @@ use crate::calendar::CalendarClient;
 use crate::custom::CustomIntegration;
 use crate::drive::DriveClient;
 use crate::gmail::GmailClient;
-use crate::types::{ApiResponse, ConnectionStatus, LeashError, DEFAULT_PLATFORM_URL};
+use crate::types::{
+    ApiResponse, ConnectionStatus, CustomMcpServerConfig, LeashError, DEFAULT_PLATFORM_URL,
+};
 
 /// Main client for the Leash platform integrations API.
 ///
@@ -268,6 +270,94 @@ impl LeashIntegrations {
     pub async fn get_env_key(&self, key: &str) -> Result<Option<String>, LeashError> {
         let env_map = self.get_env().await?;
         Ok(env_map.get(key).cloned())
+    }
+
+    /// Get the user's current access token for a provider — built-in or
+    /// org-registered (LEA-142).
+    ///
+    /// Lets you call third-party APIs directly without proxying every request
+    /// through Leash. Refresh-on-expiry happens transparently on the platform
+    /// side.
+    ///
+    /// Returns [`LeashError::NotConnected`] when the user hasn't completed the
+    /// OAuth flow for this provider, or [`LeashError::TokenExpired`] when the
+    /// stored token can't be refreshed.
+    ///
+    /// Sends `POST {platform_url}/api/integrations/token` with body
+    /// `{"provider": "<provider>"}`.
+    pub async fn get_access_token(&self, provider: &str) -> Result<String, LeashError> {
+        let url = format!("{}/api/integrations/token", self.platform_url);
+
+        let payload = serde_json::json!({ "provider": provider });
+
+        let mut req = self
+            .http
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .bearer_auth(&self.auth_token)
+            .json(&payload);
+
+        if let Some(ref key) = self.api_key {
+            req = req.header("X-API-Key", key);
+        }
+
+        let resp = req.send().await?;
+        let api_resp: ApiResponse = resp.json().await?;
+
+        if !api_resp.success {
+            return Err(api_resp.into_error());
+        }
+
+        let data = api_resp.data.unwrap_or(serde_json::Value::Null);
+        let access_token = data
+            .get("accessToken")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| LeashError::ApiError {
+                message: "missing accessToken in response".to_string(),
+                code: None,
+            })?
+            .to_string();
+
+        Ok(access_token)
+    }
+
+    /// Get the resolved config for a customer-registered MCP server (LEA-143).
+    ///
+    /// Returns the customer's MCP URL plus auth headers (e.g. `Authorization:
+    /// Bearer …` for bearer-auth servers) — feed this directly into your MCP
+    /// client. Leash isn't on the MCP request path.
+    ///
+    /// Sends `GET {platform_url}/api/integrations/mcp-config/{slug}`.
+    pub async fn get_custom_mcp_config(
+        &self,
+        slug: &str,
+    ) -> Result<CustomMcpServerConfig, LeashError> {
+        let url = format!("{}/api/integrations/mcp-config/{}", self.platform_url, slug);
+
+        let mut req = self.http.get(&url);
+
+        if !self.auth_token.is_empty() {
+            req = req.bearer_auth(&self.auth_token);
+        }
+        if let Some(ref key) = self.api_key {
+            req = req.header("X-API-Key", key);
+        }
+
+        let resp = req.send().await?;
+        let api_resp: ApiResponse = resp.json().await?;
+
+        if !api_resp.success {
+            return Err(api_resp.into_error());
+        }
+
+        let data = api_resp.data.unwrap_or(serde_json::Value::Null);
+        let config: CustomMcpServerConfig =
+            serde_json::from_value(data).map_err(|e| LeashError::ApiError {
+                message: format!("failed to parse mcp config: {e}"),
+                code: None,
+            })?;
+
+        Ok(config)
     }
 
     /// Get the URL to initiate an OAuth connection flow for the given provider.

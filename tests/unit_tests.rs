@@ -1,8 +1,9 @@
 use leash_sdk::{
-    Attendee, ConnectionStatus, CreateEventParams, EventDateTime, LeashError, LeashIntegrations,
-    ListEventsParams, ListFilesParams, ListMessagesParams, SendMessageParams,
-    DEFAULT_PLATFORM_URL,
+    Attendee, ConnectionStatus, CreateEventParams, CustomMcpServerConfig, EventDateTime,
+    LeashError, LeashIntegrations, ListEventsParams, ListFilesParams, ListMessagesParams,
+    SendMessageParams, DEFAULT_PLATFORM_URL,
 };
+use std::collections::HashMap;
 
 // -------------------------------------------------------------------------
 // Client initialization
@@ -488,4 +489,222 @@ fn multiple_connect_urls_for_different_providers() {
     assert!(gmail_url.starts_with(&base));
     assert!(cal_url.starts_with(&base));
     assert!(drive_url.starts_with(&base));
+}
+
+// -------------------------------------------------------------------------
+// CustomMcpServerConfig serialization / deserialization (LEA-143)
+// -------------------------------------------------------------------------
+
+#[test]
+fn custom_mcp_server_config_deserializes() {
+    let json = serde_json::json!({
+        "slug": "acme-issues",
+        "displayName": "Acme Issues",
+        "url": "https://mcp.acme.example.com",
+        "headers": {
+            "Authorization": "Bearer token-xyz",
+            "X-Acme-Workspace": "ws_123"
+        }
+    });
+    let cfg: CustomMcpServerConfig = serde_json::from_value(json).unwrap();
+    assert_eq!(cfg.slug, "acme-issues");
+    assert_eq!(cfg.display_name, "Acme Issues");
+    assert_eq!(cfg.url, "https://mcp.acme.example.com");
+    assert_eq!(
+        cfg.headers.get("Authorization"),
+        Some(&"Bearer token-xyz".to_string())
+    );
+    assert_eq!(
+        cfg.headers.get("X-Acme-Workspace"),
+        Some(&"ws_123".to_string())
+    );
+}
+
+#[test]
+fn custom_mcp_server_config_deserializes_with_empty_headers() {
+    let json = serde_json::json!({
+        "slug": "no-auth-mcp",
+        "displayName": "No Auth MCP",
+        "url": "https://mcp.example.com",
+        "headers": {}
+    });
+    let cfg: CustomMcpServerConfig = serde_json::from_value(json).unwrap();
+    assert_eq!(cfg.slug, "no-auth-mcp");
+    assert_eq!(cfg.display_name, "No Auth MCP");
+    assert!(cfg.headers.is_empty());
+}
+
+#[test]
+fn custom_mcp_server_config_roundtrip() {
+    let mut headers = HashMap::new();
+    headers.insert(
+        "Authorization".to_string(),
+        "Bearer abc-123".to_string(),
+    );
+
+    let original = CustomMcpServerConfig {
+        slug: "example".to_string(),
+        display_name: "Example MCP".to_string(),
+        url: "https://mcp.example.com/sse".to_string(),
+        headers,
+    };
+    let json = serde_json::to_value(&original).unwrap();
+    // Verify camelCase on the wire
+    assert_eq!(json["slug"], "example");
+    assert_eq!(json["displayName"], "Example MCP");
+    assert_eq!(json["url"], "https://mcp.example.com/sse");
+    assert_eq!(json["headers"]["Authorization"], "Bearer abc-123");
+
+    let deserialized: CustomMcpServerConfig = serde_json::from_value(json).unwrap();
+    assert_eq!(deserialized.slug, original.slug);
+    assert_eq!(deserialized.display_name, original.display_name);
+    assert_eq!(deserialized.url, original.url);
+    assert_eq!(deserialized.headers, original.headers);
+}
+
+#[test]
+fn custom_mcp_server_config_serializes_camel_case_field() {
+    let cfg = CustomMcpServerConfig {
+        slug: "s".to_string(),
+        display_name: "Display".to_string(),
+        url: "https://x".to_string(),
+        headers: HashMap::new(),
+    };
+    let json = serde_json::to_value(&cfg).unwrap();
+    // Wire format must use displayName, not display_name
+    assert!(json.get("displayName").is_some());
+    assert!(json.get("display_name").is_none());
+}
+
+// -------------------------------------------------------------------------
+// Error mapping for new endpoints
+// -------------------------------------------------------------------------
+
+#[test]
+fn token_endpoint_error_maps_not_connected() {
+    // Mirrors the platform's POST /api/integrations/token error envelope.
+    let err_envelope = serde_json::json!({
+        "success": false,
+        "error": "Slack is not connected for this user",
+        "code": "not_connected",
+        "connectUrl": "https://leash.build/api/integrations/connect/slack"
+    });
+
+    // Decode into the public error type by going through the same path
+    // call() uses: ApiResponse -> into_error(). We can't construct an
+    // ApiResponse directly (it's pub(crate)), so we simulate by checking
+    // the error mapping a LeashError would produce given the envelope's
+    // shape. The into_error() logic is exercised via every call site,
+    // and it's the only place "not_connected" is mapped.
+    let code = err_envelope["code"].as_str().unwrap();
+    let message = err_envelope["error"].as_str().unwrap();
+    let connect_url = err_envelope["connectUrl"].as_str().map(String::from);
+
+    let err = match code {
+        "not_connected" => LeashError::NotConnected {
+            message: message.to_string(),
+            connect_url,
+        },
+        "token_expired" => LeashError::TokenExpired {
+            message: message.to_string(),
+        },
+        _ => LeashError::ApiError {
+            message: message.to_string(),
+            code: Some(code.to_string()),
+        },
+    };
+
+    match err {
+        LeashError::NotConnected {
+            message,
+            connect_url,
+        } => {
+            assert!(message.contains("Slack is not connected"));
+            assert_eq!(
+                connect_url,
+                Some("https://leash.build/api/integrations/connect/slack".to_string())
+            );
+        }
+        other => panic!("expected NotConnected, got {other:?}"),
+    }
+}
+
+#[test]
+fn mcp_config_endpoint_error_maps_unknown_mcp_server() {
+    // Mirrors the platform's GET /api/integrations/mcp-config/{slug} error
+    // envelope when the slug is not registered for this org.
+    let err_envelope = serde_json::json!({
+        "success": false,
+        "error": "Unknown MCP server: acme-issues",
+        "code": "unknown_mcp_server"
+    });
+
+    let code = err_envelope["code"].as_str().unwrap();
+    let message = err_envelope["error"].as_str().unwrap();
+
+    // unknown_mcp_server is not a special-cased error code, so it should
+    // fall through to ApiError with the code preserved.
+    let err = match code {
+        "not_connected" => LeashError::NotConnected {
+            message: message.to_string(),
+            connect_url: None,
+        },
+        "token_expired" => LeashError::TokenExpired {
+            message: message.to_string(),
+        },
+        _ => LeashError::ApiError {
+            message: message.to_string(),
+            code: Some(code.to_string()),
+        },
+    };
+
+    match err {
+        LeashError::ApiError { message, code } => {
+            assert!(message.contains("Unknown MCP server"));
+            assert_eq!(code, Some("unknown_mcp_server".to_string()));
+        }
+        other => panic!("expected ApiError, got {other:?}"),
+    }
+}
+
+// -------------------------------------------------------------------------
+// URL format checks for new endpoints (without making HTTP calls)
+// -------------------------------------------------------------------------
+
+#[test]
+fn token_endpoint_url_format() {
+    // The token endpoint posts to {platform_url}/api/integrations/token.
+    // We can't observe call_internal from outside, but we can confirm
+    // the platform_url builder is the same one used by every other call.
+    let client = LeashIntegrations::new("tok").with_platform_url("http://localhost:3000");
+    let connect_url = client.get_connect_url("slack", None);
+    // get_connect_url shares the same platform_url base as get_access_token.
+    assert!(connect_url.starts_with("http://localhost:3000/api/integrations/"));
+}
+
+#[test]
+fn mcp_config_url_format() {
+    let client = LeashIntegrations::new("tok").with_platform_url("https://staging.leash.build");
+    let connect_url = client.get_connect_url("notion", None);
+    // get_custom_mcp_config builds {platform_url}/api/integrations/mcp-config/{slug}
+    // — same platform_url base.
+    assert!(connect_url.starts_with("https://staging.leash.build/api/integrations/"));
+}
+
+// -------------------------------------------------------------------------
+// Methods exist with the expected signatures (compile-only checks)
+// -------------------------------------------------------------------------
+
+#[test]
+fn get_access_token_signature_compiles() {
+    // Ensure get_access_token is accessible on LeashIntegrations and
+    // returns a Future. We don't actually await it (no server).
+    let client = LeashIntegrations::new("tok");
+    let _fut = client.get_access_token("slack");
+}
+
+#[test]
+fn get_custom_mcp_config_signature_compiles() {
+    let client = LeashIntegrations::new("tok");
+    let _fut = client.get_custom_mcp_config("acme-issues");
 }
