@@ -179,6 +179,13 @@ mod tests {
     use super::*;
     use jsonwebtoken::{encode, EncodingKey, Header};
     use serde::Serialize;
+    use std::sync::Mutex;
+
+    // Tests in this module mutate `LEASH_JWT_SECRET` — process-global state.
+    // Cargo runs tests in parallel by default, so without serialization, two
+    // tests can race on the env var (one removes it while another expects it
+    // set). Every test that reads or writes the secret takes this lock first.
+    static ENV_GUARD: Mutex<()> = Mutex::new(());
 
     #[derive(Serialize)]
     struct TestClaims {
@@ -209,6 +216,7 @@ mod tests {
 
     #[test]
     fn valid_token_returns_user() {
+        let _g = ENV_GUARD.lock().unwrap();
         // Ensure no secret so we use insecure decode.
         std::env::remove_var("LEASH_JWT_SECRET");
 
@@ -241,6 +249,7 @@ mod tests {
 
     #[test]
     fn invalid_token_returns_error() {
+        let _g = ENV_GUARD.lock().unwrap();
         std::env::remove_var("LEASH_JWT_SECRET");
 
         let header = "leash-auth=not-a-jwt";
@@ -250,6 +259,7 @@ mod tests {
 
     #[test]
     fn no_secret_decodes_without_verification() {
+        let _g = ENV_GUARD.lock().unwrap();
         std::env::remove_var("LEASH_JWT_SECRET");
 
         let claims = sample_claims();
@@ -263,6 +273,7 @@ mod tests {
 
     #[test]
     fn with_secret_verifies_signature() {
+        let _g = ENV_GUARD.lock().unwrap();
         let secret = "test-secret-key";
         std::env::set_var("LEASH_JWT_SECRET", secret);
 
@@ -277,6 +288,7 @@ mod tests {
 
     #[test]
     fn with_secret_rejects_wrong_signature() {
+        let _g = ENV_GUARD.lock().unwrap();
         let secret = "correct-secret";
         std::env::set_var("LEASH_JWT_SECRET", secret);
 
@@ -291,6 +303,7 @@ mod tests {
 
     #[test]
     fn get_leash_user_from_cookie_works_with_raw_token() {
+        let _g = ENV_GUARD.lock().unwrap();
         std::env::remove_var("LEASH_JWT_SECRET");
 
         let claims = sample_claims();
@@ -302,6 +315,7 @@ mod tests {
 
     #[test]
     fn picture_is_optional() {
+        let _g = ENV_GUARD.lock().unwrap();
         std::env::remove_var("LEASH_JWT_SECRET");
 
         let claims = TestClaims {
@@ -318,6 +332,7 @@ mod tests {
 
     #[test]
     fn is_authenticated_returns_true_for_valid_cookie() {
+        let _g = ENV_GUARD.lock().unwrap();
         std::env::remove_var("LEASH_JWT_SECRET");
 
         let claims = sample_claims();
@@ -334,6 +349,7 @@ mod tests {
 
     #[test]
     fn is_authenticated_from_cookie_returns_true_for_valid_token() {
+        let _g = ENV_GUARD.lock().unwrap();
         std::env::remove_var("LEASH_JWT_SECRET");
 
         let claims = sample_claims();
@@ -344,6 +360,7 @@ mod tests {
 
     #[test]
     fn is_authenticated_from_cookie_returns_false_for_invalid_token() {
+        let _g = ENV_GUARD.lock().unwrap();
         std::env::remove_var("LEASH_JWT_SECRET");
 
         assert!(!is_authenticated_from_cookie("not-a-jwt"));
