@@ -1,396 +1,337 @@
-use std::collections::HashMap;
-use std::sync::Mutex;
+//! The unified [`Leash`] client — the canonical entry point.
+//!
+//! Mirrors the TS `Leash`, Python `Leash`, and Go `Client`. One async surface
+//! for identity, runtime env vars, and integrations.
 
-use crate::calendar::CalendarClient;
-use crate::custom::CustomIntegration;
-use crate::drive::DriveClient;
-use crate::gmail::GmailClient;
-use crate::types::{
-    ApiResponse, ConnectionStatus, CustomMcpServerConfig, LeashError, DEFAULT_PLATFORM_URL,
-};
+use crate::auth::{Auth, LEASH_AUTH_COOKIE};
+use crate::env::Env;
+use crate::errors::{LeashError, Result};
+use crate::integrations::Integrations;
+use crate::request::LeashRequest;
+use crate::transport::Transport;
 
-/// Main client for the Leash platform integrations API.
+/// Default Leash platform URL.
+pub const DEFAULT_PLATFORM_URL: &str = "https://leash.build";
+
+/// `Authorization: Bearer …` header — captured for the env-fetch fallback,
+/// **never** forwarded on integration POSTs (see [`Transport`]).
+const AUTHORIZATION_HEADER: &str = "Authorization";
+
+/// Unified Leash client.
 ///
-/// Create one with [`LeashIntegrations::new`] then access provider clients
-/// via [`gmail()`](Self::gmail), [`calendar()`](Self::calendar), and
-/// [`drive()`](Self::drive).
+/// Construct from any HTTP request that implements [`LeashRequest`]:
 ///
-/// # Example
 /// ```no_run
-/// # async fn example() -> Result<(), leash_sdk::LeashError> {
-/// use leash_sdk::LeashIntegrations;
-///
-/// let client = LeashIntegrations::new("my-jwt-token");
-/// let messages = client.gmail().list_messages(None).await?;
-/// # Ok(())
-/// # }
+/// # async fn ex() -> leash_sdk::Result<()> {
+/// use leash_sdk::Leash;
+/// let req = http::Request::builder().body(()).unwrap();
+/// let leash = Leash::new(&req)?;
+/// let user = leash.auth().user().await?;
+/// # let _ = user; Ok(()) }
 /// ```
-pub struct LeashIntegrations {
-    pub(crate) platform_url: String,
-    pub(crate) auth_token: String,
-    pub(crate) api_key: Option<String>,
-    pub(crate) http: reqwest::Client,
-    env_cache: Mutex<Option<HashMap<String, String>>>,
+///
+/// Or for server-to-server flows:
+///
+/// ```no_run
+/// # fn ex() -> leash_sdk::Result<()> {
+/// use leash_sdk::Leash;
+/// let leash = Leash::from_api_key("lsk_live_…")?;
+/// # let _ = leash; Ok(()) }
+/// ```
+///
+/// Or from a raw JWT held by a CLI / agent:
+///
+/// ```no_run
+/// # fn ex() -> leash_sdk::Result<()> {
+/// use leash_sdk::Leash;
+/// let leash = Leash::from_token("eyJhbGciOi…")?;
+/// # let _ = leash; Ok(()) }
+/// ```
+///
+/// ## Auth precedence
+///
+/// Matches the TS / Python / Go surface:
+///
+/// 1. `LEASH_API_KEY` env var (or [`Leash::with_api_key`]) — the server key
+///    used by integration POSTs (`X-API-Key`) and env-fetch (`Authorization: Bearer`).
+/// 2. `Authorization: Bearer <jwt>` on the inbound request — used for
+///    `/api/auth/me` and, **only when no API key is configured**, as a
+///    fallback bearer on env-fetch endpoints. **Never** forwarded on
+///    integration POSTs — the platform's `verifyToken()` would reject a user
+///    JWT before the API-key check runs.
+/// 3. `leash-auth` cookie — forwarded to the platform for integration calls.
+#[derive(Debug, Clone)]
+pub struct Leash {
+    platform_url: String,
+    api_key: Option<String>,
+    bearer_token: Option<String>,
+    cookie_value: Option<String>,
+    http: reqwest::Client,
 }
 
-impl LeashIntegrations {
-    /// Create a new client with the given auth token and the default platform URL.
-    pub fn new(auth_token: impl Into<String>) -> Self {
-        Self {
-            platform_url: DEFAULT_PLATFORM_URL.to_string(),
-            auth_token: auth_token.into(),
-            api_key: std::env::var("LEASH_API_KEY").ok(),
-            http: reqwest::Client::new(),
-            env_cache: Mutex::new(None),
-        }
+impl Leash {
+    /// Construct from an inbound HTTP request.
+    ///
+    /// The request's `leash-auth` cookie and `Authorization: Bearer` header
+    /// are extracted; `LEASH_API_KEY` is read from the environment.
+    ///
+    /// **Bearer → env-fetch fallback**: when no `LEASH_API_KEY` is configured,
+    /// an inbound `Authorization: Bearer` token is used to authorise
+    /// `env.get` calls. This lets a JWT-only caller (e.g. a script holding a
+    /// user token but no server key) still resolve env vars. Bearer is
+    /// **never** forwarded on integration POSTs.
+    pub fn new<R: LeashRequest>(req: R) -> Result<Self> {
+        let cookie_value = req.cookie(LEASH_AUTH_COOKIE);
+        let bearer_token = req
+            .header(AUTHORIZATION_HEADER)
+            .and_then(extract_bearer);
+
+        Ok(Self {
+            platform_url: resolve_platform_url(None),
+            api_key: std::env::var("LEASH_API_KEY").ok().filter(|s| !s.is_empty()),
+            bearer_token,
+            cookie_value,
+            http: default_http_client(),
+        })
     }
 
-    /// Set a custom platform URL (overrides the default `https://leash.build`).
+    /// Construct a server-to-server client from an explicit API key.
+    ///
+    /// The key is sent as `X-API-Key` on integration calls and as
+    /// `Authorization: Bearer` on env-fetch calls. No `leash-auth` cookie is
+    /// set — integration calls that require user context will return a
+    /// [`LeashError::Unauthorized`].
+    pub fn from_api_key(api_key: impl Into<String>) -> Result<Self> {
+        let key = api_key.into();
+        if key.is_empty() {
+            return Err(LeashError::Unauthorized {
+                message: "LEASH_API_KEY is empty.".to_string(),
+            });
+        }
+        Ok(Self {
+            platform_url: resolve_platform_url(None),
+            api_key: Some(key),
+            bearer_token: None,
+            cookie_value: None,
+            http: default_http_client(),
+        })
+    }
+
+    /// Construct from a raw user JWT (CLI / agent flows).
+    ///
+    /// The token is forwarded as the `leash-auth` cookie value on integration
+    /// calls and is used for identity reads via [`Self::auth`].
+    pub fn from_token(token: impl Into<String>) -> Result<Self> {
+        let tok = token.into();
+        if tok.is_empty() {
+            return Err(LeashError::Unauthorized {
+                message: "JWT is empty.".to_string(),
+            });
+        }
+        Ok(Self {
+            platform_url: resolve_platform_url(None),
+            api_key: std::env::var("LEASH_API_KEY").ok().filter(|s| !s.is_empty()),
+            bearer_token: Some(tok.clone()),
+            cookie_value: Some(tok),
+            http: default_http_client(),
+        })
+    }
+
+    /// Override the platform base URL (defaults to `LEASH_PLATFORM_URL` env
+    /// var or `https://leash.build`).
+    #[must_use]
     pub fn with_platform_url(mut self, url: impl Into<String>) -> Self {
         self.platform_url = url.into().trim_end_matches('/').to_string();
         self
     }
 
-    /// Set an API key for service-to-service authentication.
-    ///
-    /// When set, the key is sent as the `X-API-Key` header on every request.
+    /// Provide an explicit API key, overriding the env var.
+    #[must_use]
     pub fn with_api_key(mut self, api_key: impl Into<String>) -> Self {
         self.api_key = Some(api_key.into());
         self
     }
 
-    /// Set a custom reqwest HTTP client.
-    pub fn with_http_client(mut self, client: reqwest::Client) -> Self {
-        self.http = client;
+    /// Inject a custom [`reqwest::Client`] (useful for tests + custom transports).
+    #[must_use]
+    pub fn with_http_client(mut self, http: reqwest::Client) -> Self {
+        self.http = http;
         self
     }
 
-    /// Return a [`GmailClient`] for interacting with the Gmail integration.
-    pub fn gmail(&self) -> GmailClient<'_> {
-        GmailClient { client: self }
-    }
+    // ----------------------------------------------------------------------
+    // Namespaces
+    // ----------------------------------------------------------------------
 
-    /// Return a [`CalendarClient`] for interacting with the Google Calendar integration.
-    pub fn calendar(&self) -> CalendarClient<'_> {
-        CalendarClient { client: self }
-    }
-
-    /// Return a [`DriveClient`] for interacting with the Google Drive integration.
-    pub fn drive(&self) -> DriveClient<'_> {
-        DriveClient { client: self }
-    }
-
-    /// Return a [`CustomIntegration`] for the given integration name.
-    ///
-    /// This is the escape hatch for custom or untyped integrations that don't
-    /// have dedicated provider clients.
-    pub fn integration(&self, name: &str) -> CustomIntegration<'_> {
-        CustomIntegration::new(name, self)
-    }
-
-    /// Perform a generic integration API call.
-    ///
-    /// Sends `POST {platform_url}/api/integrations/{provider}/{action}` with the
-    /// given JSON body and returns the `data` field from the response envelope.
-    pub async fn call(
-        &self,
-        provider: &str,
-        action: &str,
-        body: Option<serde_json::Value>,
-    ) -> Result<serde_json::Value, LeashError> {
-        self.call_internal(provider, action, body).await
-    }
-
-    /// Internal call used by all provider clients.
-    pub(crate) async fn call_internal(
-        &self,
-        provider: &str,
-        action: &str,
-        body: Option<serde_json::Value>,
-    ) -> Result<serde_json::Value, LeashError> {
-        let url = format!(
-            "{}/api/integrations/{}/{}",
-            self.platform_url, provider, action
-        );
-
-        let mut req = self
-            .http
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .bearer_auth(&self.auth_token);
-
-        if let Some(ref key) = self.api_key {
-            req = req.header("X-API-Key", key);
-        }
-
-        if let Some(b) = body {
-            req = req.json(&b);
-        }
-
-        let resp = req.send().await?;
-        let api_resp: ApiResponse = resp.json().await?;
-
-        if !api_resp.success {
-            return Err(api_resp.into_error());
-        }
-
-        Ok(api_resp.data.unwrap_or(serde_json::Value::Null))
-    }
-
-    /// Check whether a provider is connected for the current user.
-    pub async fn is_connected(&self, provider_id: &str) -> bool {
-        match self.get_connections().await {
-            Ok(connections) => connections
-                .iter()
-                .any(|c| c.provider_id == provider_id && c.status == "active"),
-            Err(_) => false,
+    /// `leash.auth()` — identity reads (non-throwing).
+    pub fn auth(&self) -> Auth {
+        Auth {
+            cookie: self.cookie_value.clone(),
         }
     }
 
-    /// Get connection status for all providers.
-    pub async fn get_connections(&self) -> Result<Vec<ConnectionStatus>, LeashError> {
-        let url = format!("{}/api/integrations/connections", self.platform_url);
-
-        let mut req = self.http.get(&url);
-
-        if !self.auth_token.is_empty() {
-            req = req.bearer_auth(&self.auth_token);
-        }
-        if let Some(ref key) = self.api_key {
-            req = req.header("X-API-Key", key);
-        }
-
-        let resp = req.send().await?;
-        let api_resp: ApiResponse = resp.json().await?;
-
-        if !api_resp.success {
-            return Err(api_resp.into_error());
-        }
-
-        let data = api_resp.data.unwrap_or(serde_json::Value::Null);
-        let connections: Vec<ConnectionStatus> =
-            serde_json::from_value(data).map_err(|e| LeashError::ApiError {
-                message: format!("failed to parse connections: {e}"),
-                code: None,
-            })?;
-
-        Ok(connections)
+    /// `leash.env()` — runtime env-var fetcher with TTL cache.
+    pub fn env(&self) -> Env {
+        // Bearer → env-fetch fallback (documented in [`Self::new`]).
+        let key = self
+            .api_key
+            .clone()
+            .or_else(|| self.bearer_token.clone());
+        Env::new(self.platform_url.clone(), key, self.http.clone())
     }
 
-    /// Call any MCP server tool directly via the Leash platform.
-    ///
-    /// Sends `POST {platform_url}/api/mcp/run` with the given npm package name,
-    /// tool name, and optional arguments, then returns the `data` field.
-    pub async fn mcp(
-        &self,
-        package: &str,
-        tool: &str,
-        args: serde_json::Value,
-    ) -> Result<serde_json::Value, LeashError> {
-        let url = format!("{}/api/mcp/run", self.platform_url);
-
-        let payload = serde_json::json!({
-            "package": package,
-            "tool": tool,
-            "args": args,
-        });
-
-        let mut req = self
-            .http
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .json(&payload);
-
-        if !self.auth_token.is_empty() {
-            req = req.bearer_auth(&self.auth_token);
-        }
-        if let Some(ref key) = self.api_key {
-            req = req.header("X-API-Key", key);
-        }
-
-        let resp = req.send().await?;
-        let api_resp: ApiResponse = resp.json().await?;
-
-        if !api_resp.success {
-            return Err(api_resp.into_error());
-        }
-
-        Ok(api_resp.data.unwrap_or(serde_json::Value::Null))
+    /// `leash.integrations()` — typed providers + generic escape hatch.
+    pub fn integrations(&self) -> Integrations {
+        Integrations::new(self.transport())
     }
 
-    /// Fetch all environment variables from the Leash platform.
-    ///
-    /// The result is cached after the first successful call.
-    pub async fn get_env(&self) -> Result<HashMap<String, String>, LeashError> {
-        // Check cache first.
-        {
-            let cache = self.env_cache.lock().unwrap();
-            if let Some(ref cached) = *cache {
-                return Ok(cached.clone());
-            }
-        }
+    // ----------------------------------------------------------------------
+    // Inspectors (handy for tests + debug)
+    // ----------------------------------------------------------------------
 
-        let url = format!("{}/api/apps/env", self.platform_url);
-
-        let mut req = self.http.get(&url);
-
-        if !self.auth_token.is_empty() {
-            req = req.bearer_auth(&self.auth_token);
-        }
-        if let Some(ref key) = self.api_key {
-            req = req.header("X-API-Key", key);
-        }
-
-        let resp = req.send().await?;
-        let api_resp: ApiResponse = resp.json().await?;
-
-        if !api_resp.success {
-            return Err(api_resp.into_error());
-        }
-
-        let data = api_resp.data.unwrap_or(serde_json::Value::Null);
-        let env_map: HashMap<String, String> =
-            serde_json::from_value(data).map_err(|e| LeashError::ApiError {
-                message: format!("failed to parse env data: {e}"),
-                code: None,
-            })?;
-
-        // Store in cache.
-        {
-            let mut cache = self.env_cache.lock().unwrap();
-            *cache = Some(env_map.clone());
-        }
-
-        Ok(env_map)
+    /// The resolved platform base URL.
+    pub fn platform_url(&self) -> &str {
+        &self.platform_url
     }
 
-    /// Fetch a single environment variable by key.
-    ///
-    /// Returns `None` if the key is not present.
-    pub async fn get_env_key(&self, key: &str) -> Result<Option<String>, LeashError> {
-        let env_map = self.get_env().await?;
-        Ok(env_map.get(key).cloned())
+    /// Returns `true` when an `X-API-Key` will be sent on integration calls.
+    pub fn has_api_key(&self) -> bool {
+        self.api_key.is_some()
     }
 
-    /// Get the user's current access token for a provider — built-in or
-    /// org-registered (LEA-142).
-    ///
-    /// Lets you call third-party APIs directly without proxying every request
-    /// through Leash. Refresh-on-expiry happens transparently on the platform
-    /// side.
-    ///
-    /// Returns [`LeashError::NotConnected`] when the user hasn't completed the
-    /// OAuth flow for this provider, or [`LeashError::TokenExpired`] when the
-    /// stored token can't be refreshed.
-    ///
-    /// Sends `POST {platform_url}/api/integrations/token` with body
-    /// `{"provider": "<provider>"}`.
-    pub async fn get_access_token(&self, provider: &str) -> Result<String, LeashError> {
-        let url = format!("{}/api/integrations/token", self.platform_url);
-
-        let payload = serde_json::json!({ "provider": provider });
-
-        let mut req = self
-            .http
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .bearer_auth(&self.auth_token)
-            .json(&payload);
-
-        if let Some(ref key) = self.api_key {
-            req = req.header("X-API-Key", key);
-        }
-
-        let resp = req.send().await?;
-        let api_resp: ApiResponse = resp.json().await?;
-
-        if !api_resp.success {
-            return Err(api_resp.into_error());
-        }
-
-        let data = api_resp.data.unwrap_or(serde_json::Value::Null);
-        let access_token = data
-            .get("accessToken")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| LeashError::ApiError {
-                message: "missing accessToken in response".to_string(),
-                code: None,
-            })?
-            .to_string();
-
-        Ok(access_token)
+    /// Returns `true` when a `leash-auth` cookie will be forwarded on integration calls.
+    pub fn has_cookie(&self) -> bool {
+        self.cookie_value.is_some()
     }
 
-    /// Get the resolved config for a customer-registered MCP server (LEA-143).
-    ///
-    /// Returns the customer's MCP URL plus auth headers (e.g. `Authorization:
-    /// Bearer …` for bearer-auth servers) — feed this directly into your MCP
-    /// client. Leash isn't on the MCP request path.
-    ///
-    /// Sends `GET {platform_url}/api/integrations/mcp-config/{slug}`.
-    pub async fn get_custom_mcp_config(
-        &self,
-        slug: &str,
-    ) -> Result<CustomMcpServerConfig, LeashError> {
-        let url = format!("{}/api/integrations/mcp-config/{}", self.platform_url, slug);
-
-        let mut req = self.http.get(&url);
-
-        if !self.auth_token.is_empty() {
-            req = req.bearer_auth(&self.auth_token);
-        }
-        if let Some(ref key) = self.api_key {
-            req = req.header("X-API-Key", key);
-        }
-
-        let resp = req.send().await?;
-        let api_resp: ApiResponse = resp.json().await?;
-
-        if !api_resp.success {
-            return Err(api_resp.into_error());
-        }
-
-        let data = api_resp.data.unwrap_or(serde_json::Value::Null);
-        let config: CustomMcpServerConfig =
-            serde_json::from_value(data).map_err(|e| LeashError::ApiError {
-                message: format!("failed to parse mcp config: {e}"),
-                code: None,
-            })?;
-
-        Ok(config)
+    /// Returns `true` when an inbound Bearer was captured (used for env-fetch fallback).
+    pub fn has_bearer(&self) -> bool {
+        self.bearer_token.is_some()
     }
 
-    /// Get the URL to initiate an OAuth connection flow for the given provider.
-    ///
-    /// Use this URL in UI buttons or redirects to connect a user's account.
-    pub fn get_connect_url(&self, provider_id: &str, return_url: Option<&str>) -> String {
-        let base = format!(
-            "{}/api/integrations/connect/{}",
-            self.platform_url, provider_id
-        );
-        match return_url {
-            Some(url) => {
-                let encoded = urlencoding_encode(url);
-                format!("{base}?return_url={encoded}")
-            }
-            None => base,
-        }
+    fn transport(&self) -> Transport {
+        Transport::new(
+            self.platform_url.clone(),
+            self.api_key.clone(),
+            self.cookie_value.clone(),
+            self.http.clone(),
+        )
     }
 }
 
-/// Minimal percent-encoding for the return_url query parameter.
-fn urlencoding_encode(input: &str) -> String {
-    let mut out = String::with_capacity(input.len() * 2);
-    for byte in input.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(byte as char);
-            }
-            _ => {
-                out.push('%');
-                out.push_str(&format!("{byte:02X}"));
-            }
-        }
+fn resolve_platform_url(override_url: Option<String>) -> String {
+    let raw = override_url
+        .or_else(|| std::env::var("LEASH_PLATFORM_URL").ok())
+        .unwrap_or_else(|| DEFAULT_PLATFORM_URL.to_string());
+    let trimmed = raw.trim_end_matches('/').to_string();
+    if trimmed.is_empty() {
+        DEFAULT_PLATFORM_URL.to_string()
+    } else {
+        trimmed
     }
-    out
+}
+
+fn default_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+fn extract_bearer(value: String) -> Option<String> {
+    let mut parts = value.splitn(2, ' ');
+    let scheme = parts.next()?;
+    if !scheme.eq_ignore_ascii_case("Bearer") {
+        return None;
+    }
+    let tok = parts.next()?.trim();
+    if tok.is_empty() {
+        None
+    } else {
+        Some(tok.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn req_with(cookie: Option<&str>, auth: Option<&str>) -> http::Request<()> {
+        let mut builder = http::Request::builder().uri("/");
+        if let Some(c) = cookie {
+            builder = builder.header("cookie", c);
+        }
+        if let Some(a) = auth {
+            builder = builder.header("authorization", a);
+        }
+        builder.body(()).unwrap()
+    }
+
+    #[test]
+    fn new_captures_cookie() {
+        std::env::remove_var("LEASH_API_KEY");
+        let req = req_with(Some("leash-auth=tok"), None);
+        let leash = Leash::new(&req).unwrap();
+        assert!(leash.has_cookie());
+        assert!(!leash.has_api_key());
+        assert!(!leash.has_bearer());
+    }
+
+    #[test]
+    fn new_captures_bearer() {
+        std::env::remove_var("LEASH_API_KEY");
+        let req = req_with(None, Some("Bearer abc"));
+        let leash = Leash::new(&req).unwrap();
+        assert!(leash.has_bearer());
+        assert!(!leash.has_api_key());
+    }
+
+    #[test]
+    fn from_api_key_rejects_empty() {
+        let err = Leash::from_api_key("").unwrap_err();
+        assert!(err.is_unauthorized());
+    }
+
+    #[test]
+    fn from_token_rejects_empty() {
+        let err = Leash::from_token("").unwrap_err();
+        assert!(err.is_unauthorized());
+    }
+
+    #[test]
+    fn with_api_key_overrides_env() {
+        let req = req_with(None, None);
+        let leash = Leash::new(&req).unwrap().with_api_key("override");
+        assert!(leash.has_api_key());
+    }
+
+    #[test]
+    fn with_platform_url_trims_trailing_slash() {
+        let req = req_with(None, None);
+        let leash = Leash::new(&req)
+            .unwrap()
+            .with_platform_url("https://staging.leash.build/");
+        assert_eq!(leash.platform_url(), "https://staging.leash.build");
+    }
+
+    #[test]
+    fn extract_bearer_handles_missing_and_malformed() {
+        assert_eq!(extract_bearer("Bearer abc".to_string()), Some("abc".to_string()));
+        assert_eq!(extract_bearer("bearer abc".to_string()), Some("abc".to_string()));
+        assert_eq!(extract_bearer("Token abc".to_string()), None);
+        assert_eq!(extract_bearer("Bearer  ".to_string()), None);
+        assert_eq!(extract_bearer("".to_string()), None);
+    }
+
+    #[test]
+    fn env_fallback_uses_bearer_when_no_api_key() {
+        std::env::remove_var("LEASH_API_KEY");
+        let req = req_with(None, Some("Bearer fallback_jwt"));
+        let leash = Leash::new(&req).unwrap();
+        // Construct env namespace and check the api_key bag (private) by
+        // observing behaviour through has_bearer + has_api_key inspectors.
+        assert!(leash.has_bearer());
+        assert!(!leash.has_api_key());
+        // The env namespace constructor folds bearer→key — exercised in HTTP tests.
+        let _env = leash.env();
+    }
 }

@@ -1,15 +1,43 @@
 [package]
 name = "leash-sdk"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2021"
-description = "Rust SDK for the Leash platform integrations API"
+description = "Rust SDK for the Leash platform — unified async client for auth, env, and integrations."
 license = "Apache-2.0"
 repository = "https://github.com/leash-build/leash-sdk-rust"
-keywords = ["leash", "integrations", "gmail", "calendar", "drive"]
+homepage = "https://leash.build"
+documentation = "https://docs.rs/leash-sdk"
+keywords = ["leash", "integrations", "gmail", "calendar", "linear"]
+categories = ["api-bindings", "asynchronous", "authentication"]
+readme = "README.md"
 
 [dependencies]
-jsonwebtoken = "9"
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["full"] }
+http = "1"
+thiserror = "1"
+base64 = "0.22"
+
+# Optional framework integrations — gated so consumers don't pull axum/actix
+# unless they actually use them.
+axum-core = { version = "0.5", optional = true }
+http-body = { version = "1", optional = true }
+actix-web = { version = "4", optional = true, default-features = false, features = ["cookies"] }
+
+[features]
+default = []
+axum = ["dep:axum-core", "dep:http-body"]
+actix-web = ["dep:actix-web"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+wiremock = "0.6"
+serde_json = "1"
+axum-core = "0.5"
+http-body = "1"
+actix-web = { version = "4", default-features = false, features = ["cookies"] }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

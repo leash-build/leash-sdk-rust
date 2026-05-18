@@ -1,93 +1,161 @@
 # leash-sdk (Rust)
 
-Rust SDK for Leash-hosted integrations.
+Rust SDK for the [Leash](https://leash.build) platform — one unified async client for authentication, runtime env vars, and integrations.
 
-Use it to call provider actions through the Leash platform proxy instead of handling provider OAuth and token storage yourself.
+Framework-agnostic. Works with axum, actix-web, plain `http::Request`, and anything else you can extract cookies + headers from.
 
 ## Installation
 
 ```toml
 [dependencies]
-leash-sdk = "0.2"
-tokio = { version = "1", features = ["full"] }
+leash-sdk = "0.4"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+# Optional framework integrations — pick what you use.
+# leash-sdk = { version = "0.4", features = ["axum"] }
+# leash-sdk = { version = "0.4", features = ["actix-web"] }
 ```
 
 ## Quick Start
 
 ```rust
-use leash_sdk::LeashIntegrations;
+use leash_sdk::{Leash, GmailListParams};
 
 #[tokio::main]
-async fn main() -> Result<(), leash_sdk::LeashError> {
-    let client = LeashIntegrations::new("your-platform-jwt")
-        .with_platform_url("https://leash.build")
-        .with_api_key("optional-app-api-key");
+async fn main() -> leash_sdk::Result<()> {
+    // Server-to-server (CLI / agent / cron).
+    let leash = Leash::from_api_key(std::env::var("LEASH_API_KEY").unwrap())?;
 
-    let messages = client.gmail().list_messages(None).await?;
-    let connected = client.is_connected("gmail").await;
-    let connect_url = client.get_connect_url("gmail", Some("https://myapp.example.com/settings"));
+    // Identity
+    let _ = leash.auth().user().await?;
 
-    println!("connected: {}", connected);
-    println!("messages: {}", messages);
-    println!("connect url: {}", connect_url);
+    // Env vars (60s TTL cache, dedicated get_fresh for cache-bypass)
+    let openai_key = leash.env().get("OPENAI_API_KEY").await?;
+
+    // Integrations — typed verbs through the platform proxy.
+    let msgs = leash.integrations().gmail().list_messages(GmailListParams {
+        max_results: Some(5),
+        ..Default::default()
+    }).await?;
+
+    println!("openai_key set? {}", openai_key.is_some());
+    println!("messages: {}", msgs.messages.len());
     Ok(())
 }
 ```
 
-## Default Platform URL
+## Request-bound construction
 
-- `https://leash.build`
+The canonical entry point: `Leash::new(req)` reads `LEASH_API_KEY` from env, plus the inbound request's `leash-auth` cookie and `Authorization: Bearer` header.
 
-## Features
+### axum
 
-- Gmail
-- Google Calendar
-- Google Drive
-- connection status lookup
-- connect URL generation
-- generic provider calls
-- custom integration calls
-- app env fetch and caching
-- MCP execution through the platform
+```rust,no_run
+use axum::{routing::get, Router, extract::Request};
+use leash_sdk::Leash;
 
-## Server Auth
+async fn me(req: Request) -> Result<String, String> {
+    let leash = Leash::new(&req).map_err(|e| e.to_string())?;
+    let user = leash.auth().user().await.map_err(|e| e.to_string())?;
+    Ok(format!("hi {}", user.map(|u| u.name).unwrap_or_default()))
+}
 
-The SDK includes framework-agnostic helpers for authenticating users on the
-server side by reading the `leash-auth` cookie set by the Leash platform.
+let _app = Router::<()>::new().route("/me", get(me));
+```
 
-```rust
-use leash_sdk::{get_leash_user, is_authenticated};
+### actix-web
 
-// In any handler that has access to the raw Cookie header:
-let user = leash_sdk::get_leash_user(cookie_header)?;
-println!("Hello, {}", user.name);
+```rust,no_run
+use actix_web::{get, HttpRequest, Responder};
+use leash_sdk::Leash;
 
-// Or just check authentication:
-if leash_sdk::is_authenticated(cookie_header) {
-    // proceed
+#[get("/me")]
+async fn me(req: HttpRequest) -> impl Responder {
+    let leash = Leash::new(&req).unwrap();
+    let user = leash.auth().user().await.unwrap();
+    format!("hi {}", user.map(|u| u.name).unwrap_or_default())
 }
 ```
 
-If your framework has already parsed cookies, use the token directly:
+### Plain `http::Request`
 
 ```rust
-let user = leash_sdk::get_leash_user_from_cookie(token)?;
+use leash_sdk::Leash;
+
+let req = http::Request::builder()
+    .header("cookie", "leash-auth=…")
+    .body(()).unwrap();
+let leash = Leash::new(&req).unwrap();
 ```
 
-## MCP Calls
+## Auth precedence
 
-Execute MCP-backed tools through the platform:
+1. `LEASH_API_KEY` env var (or `Leash::with_api_key(...)`).
+2. `Authorization: Bearer <jwt>` on the inbound request — used for identity and, **only when no API key is configured**, as a fallback bearer on env-fetch endpoints. **Never** forwarded on integration POSTs (the platform's `verifyToken()` rejects user JWTs before the API-key check runs).
+3. `leash-auth` cookie — forwarded to the platform on integration calls.
+
+## Integration verbs
+
+| Provider | Verbs |
+|---|---|
+| `gmail()` | `list_messages`, `get_message`, `send_message`, `search_messages`, `list_labels`, `get_profile` |
+| `calendar()` (alias `google_calendar()`) | `list_calendars`, `list_events`, `create_event`, `get_event` |
+| `drive()` (alias `google_drive()`) | `list_files`, `get_file`, `download_file`, `create_folder`, `upload_file`, `delete_file`, `search_files` |
+| `linear()` | `list_issues`, `get_issue`, `create_issue`, `update_issue`, `add_comment`, `list_teams`, `list_projects` |
+| `provider(name)` | `call(action, body)` — generic escape hatch for Slack, GitHub, HubSpot, … |
+
+```rust,no_run
+use leash_sdk::{Leash, LinearListIssuesFilter};
+# async fn ex() -> leash_sdk::Result<()> {
+let leash = Leash::from_api_key("lsk_…")?;
+
+let issues = leash.integrations().linear().list_issues(LinearListIssuesFilter {
+    state_type: Some("started".into()),
+    ..Default::default()
+}).await?;
+
+let res = leash.integrations().provider("slack").call(
+    "post_message",
+    serde_json::json!({ "channel": "#general", "text": "hi" }),
+).await?;
+# let _ = (issues, res); Ok(()) }
+```
+
+## Errors
+
+`LeashError` is a structured enum. Predicates cover the common branches:
 
 ```rust
-let result = client.run_mcp("@some/mcp-package", "tool-name", serde_json::json!({"key": "value"})).await?;
+# fn handle(err: leash_sdk::LeashError) {
+if err.is_plan_block()          { /* show upgrade UI */ }
+if err.is_connection_required() { /* show "connect Gmail" CTA */ }
+if err.is_unauthorized()        { /* re-auth */ }
+if err.is_key_not_declared()    { /* show developer-facing hint */ }
+# }
 ```
 
-## Notes
+`env().get(key)` returns `Result<Option<String>>` — `Ok(None)` for KEY_NOT_DECLARED, `Err(_)` for actual errors so you can branch with `if value.is_none()`.
 
-- pass a valid Leash platform JWT as the auth token
-- use `with_api_key(...)` for app-scoped access when needed
-- provider OAuth remains a platform concern, not an SDK concern
+## TLS
+
+`reqwest` is configured with `rustls-tls` only — no OpenSSL transitively.
+
+## What's NOT in 0.4 yet
+
+- **Dev-auth cookie-exchange handler** (`Leash::createDevAuthHandler` in TS) — the local-dev `/api/leash/dev-auth` flow is TS-only for 0.4. Rust callers using local dev should rely on the cookie pre-set by `leash up` instead.
+- **Browser-mode client** — there's no WASM/browser build. Construct from a server route.
+- **MCP exec helpers** (`run_mcp`, custom MCP config) — out of scope for the unified 0.4 client. Use the generic `provider(name).call(...)` escape hatch if you need to reach an MCP-backed integration directly.
+- **Connection status / connect URL helpers** (`is_connected`, `get_connect_url`, `get_connections`) — surface to be re-added in a follow-up once the platform's `/api/integrations/connections` shape stabilises.
+
+If you depended on any of these in 0.3.x, pin to `leash-sdk = "0.3"` and migrate when the replacement lands.
+
+## Compatibility
+
+| SDK | Wire-compatible with platform |
+|---|---|
+| 0.4.x | leash.build (current) |
+| 0.3.x | leash.build (legacy `LeashIntegrations` surface) |
 
 ## License
 
-Apache-2.0
+Apache-2.0.
