@@ -1,172 +1,330 @@
-//! Framework-agnostic server authentication for the Leash platform.
+//! Identity helpers — extract the authenticated [`LeashUser`] off a JWT.
 //!
-//! Extracts the authenticated user from the `leash-auth` cookie without
-//! depending on any specific web framework.  Works with actix-web, axum,
-//! rocket, warp, or any framework that can give you the raw `Cookie` header
-//! value.
-//!
-//! # Example (axum)
-//!
-//! ```no_run
-//! use leash_sdk::auth::get_leash_user;
-//!
-//! // In an axum handler:
-//! // let cookie_header = headers.get("cookie").map(|v| v.to_str().unwrap());
-//! // let user = get_leash_user(cookie_header.unwrap_or(""))?;
-//! ```
+//! Mirrors `leash-sdk-ts/src/server/auth.ts`, `leash-sdk-python/leash/auth.py`,
+//! and `leash-sdk-go/auth.go`. JWT parsing is stdlib-only (no `jsonwebtoken`
+//! dependency) so the SDK stays slim and avoids OpenSSL transitively.
 
-use crate::types::LeashError;
-use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 
+use crate::errors::{LeashError, Result};
+use crate::request::LeashRequest;
+
 /// The cookie name set by the Leash platform.
-const LEASH_AUTH_COOKIE: &str = "leash-auth";
+pub const LEASH_AUTH_COOKIE: &str = "leash-auth";
 
 /// Authenticated user extracted from a Leash JWT.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+///
+/// Returned by [`Auth::user`](crate::Auth::user) and the standalone
+/// [`get_leash_user`] helper.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LeashUser {
-    /// Unique user identifier.
-    #[serde(rename = "userId")]
+    /// Unique user identifier (`userId` claim, with `sub` fallback).
     pub id: String,
-    /// User email address.
+    /// Email address.
     pub email: String,
     /// Display name.
     pub name: String,
-    /// Profile picture URL, if available.
-    #[serde(default)]
+    /// Profile picture URL, when present in the JWT.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub picture: Option<String>,
 }
 
-/// JWT claims — a superset of [`LeashUser`] that includes standard JWT fields.
-#[derive(Debug, Deserialize)]
+/// Raw JWT claims set by the platform on the `leash-auth` cookie.
+#[derive(Debug, Default, Deserialize)]
 struct Claims {
-    #[serde(rename = "userId")]
-    user_id: String,
-    email: String,
-    name: String,
+    #[serde(rename = "userId", default)]
+    user_id: Option<String>,
+    #[serde(default)]
+    sub: Option<String>,
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
     #[serde(default)]
     picture: Option<String>,
+    #[serde(default)]
+    exp: Option<i64>,
 }
 
-impl From<Claims> for LeashUser {
-    fn from(c: Claims) -> Self {
-        Self {
-            id: c.user_id,
-            email: c.email,
-            name: c.name,
-            picture: c.picture,
-        }
+impl Claims {
+    fn into_user(self) -> Result<LeashUser> {
+        let id = self
+            .user_id
+            .or(self.sub)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| LeashError::Unauthorized {
+                message: "leash-auth cookie is missing a user identifier.".to_string(),
+            })?;
+        Ok(LeashUser {
+            id,
+            email: self.email.unwrap_or_default(),
+            name: self.name.unwrap_or_default(),
+            picture: self.picture,
+        })
     }
 }
 
-/// Extract the authenticated [`LeashUser`] from a raw `Cookie` header string.
+/// Decode a raw `leash-auth` JWT into a [`LeashUser`].
 ///
-/// Parses the header to find the `leash-auth` cookie, then decodes the JWT.
-/// If the `LEASH_JWT_SECRET` environment variable is set the signature is
-/// verified; otherwise the token is decoded without verification.
-///
-/// # Errors
-///
-/// Returns [`LeashError::ApiError`] if:
-/// - The `leash-auth` cookie is not present in the header.
-/// - The JWT cannot be decoded or verified.
-pub fn get_leash_user(cookie_header: &str) -> Result<LeashUser, LeashError> {
-    let token = parse_cookie(cookie_header, LEASH_AUTH_COOKIE).ok_or_else(|| {
-        LeashError::ApiError {
-            message: "leash-auth cookie not found".to_string(),
-            code: Some("missing_cookie".to_string()),
-        }
-    })?;
-
-    get_leash_user_from_cookie(token)
+/// When `LEASH_JWT_SECRET` is set, the HS256 signature is verified. Without
+/// it, the SDK falls back to verify-disabled decoding so local development
+/// works without provisioning the secret. The expiry claim is always
+/// honoured — expired tokens are rejected regardless of signature mode.
+pub fn decode_user(token: &str) -> Result<LeashUser> {
+    let claims = decode_claims(token)?;
+    claims.into_user()
 }
 
-/// Decode a [`LeashUser`] directly from a raw JWT token string.
+/// Read the request's `leash-auth` cookie and decode it.
 ///
-/// This is useful when your framework has already parsed the cookies for you
-/// and you have the token value in hand.
-///
-/// If the `LEASH_JWT_SECRET` environment variable is set the signature is
-/// verified; otherwise the token is decoded without verification.
-///
-/// # Errors
-///
-/// Returns [`LeashError::ApiError`] if the JWT cannot be decoded or verified.
-pub fn get_leash_user_from_cookie(token: &str) -> Result<LeashUser, LeashError> {
-    let claims = decode_jwt(token)?;
-    Ok(LeashUser::from(claims))
+/// Errors when the cookie is missing or the JWT is invalid. Use
+/// [`Auth::user`](crate::Auth::user) for a non-throwing variant.
+pub fn get_leash_user<R: LeashRequest>(req: R) -> Result<LeashUser> {
+    let token = req
+        .cookie(LEASH_AUTH_COOKIE)
+        .ok_or_else(|| LeashError::Unauthorized {
+            message: "No leash-auth cookie on the request.".to_string(),
+        })?;
+    decode_user(&token)
 }
 
-/// Check whether the raw `Cookie` header contains a valid `leash-auth` token.
-///
-/// Returns `true` when [`get_leash_user`] would succeed, `false` otherwise.
-pub fn is_authenticated(cookie_header: &str) -> bool {
-    get_leash_user(cookie_header).is_ok()
-}
-
-/// Check whether a raw JWT token string represents a valid Leash session.
-///
-/// Returns `true` when [`get_leash_user_from_cookie`] would succeed, `false`
-/// otherwise.
-pub fn is_authenticated_from_cookie(token: &str) -> bool {
-    get_leash_user_from_cookie(token).is_ok()
+/// `true` when [`get_leash_user`] would succeed.
+pub fn is_authenticated<R: LeashRequest>(req: R) -> bool {
+    get_leash_user(req).is_ok()
 }
 
 // ---------------------------------------------------------------------------
-// Internal helpers
+// Internal
 // ---------------------------------------------------------------------------
 
-/// Find a cookie value by name in a raw `Cookie` header string.
-fn parse_cookie<'a>(header: &'a str, name: &str) -> Option<&'a str> {
-    for pair in header.split(';') {
-        let pair = pair.trim();
-        if let Some(rest) = pair.strip_prefix(name) {
-            if let Some(value) = rest.strip_prefix('=') {
-                let value = value.trim();
-                if !value.is_empty() {
-                    return Some(value);
-                }
-            }
+fn decode_claims(token: &str) -> Result<Claims> {
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return Err(LeashError::Unauthorized {
+            message: "Invalid leash-auth cookie: malformed JWT.".to_string(),
+        });
+    }
+
+    // Optional signature check.
+    if let Ok(secret) = std::env::var("LEASH_JWT_SECRET") {
+        if !secret.is_empty() {
+            verify_hs256(parts[0], parts[1], parts[2], &secret)?;
         }
     }
-    None
+
+    let payload_bytes =
+        URL_SAFE_NO_PAD
+            .decode(parts[1].as_bytes())
+            .map_err(|_| LeashError::Unauthorized {
+                message: "Invalid leash-auth cookie: payload not valid base64url.".to_string(),
+            })?;
+
+    let claims: Claims =
+        serde_json::from_slice(&payload_bytes).map_err(|_| LeashError::Unauthorized {
+            message: "Invalid leash-auth cookie: payload not valid JSON.".to_string(),
+        })?;
+
+    // Expiry check — even when signature verification is disabled.
+    if let Some(exp) = claims.exp {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        if exp > 0 && now > exp {
+            return Err(LeashError::Unauthorized {
+                message: "leash-auth cookie has expired.".to_string(),
+            });
+        }
+    }
+
+    Ok(claims)
 }
 
-/// Decode (and optionally verify) a JWT token into [`Claims`].
-fn decode_jwt(token: &str) -> Result<Claims, LeashError> {
-    match std::env::var("LEASH_JWT_SECRET") {
-        Ok(secret) if !secret.is_empty() => {
-            // Verify signature with the configured secret.
-            let key = DecodingKey::from_secret(secret.as_bytes());
-            let mut validation = Validation::new(Algorithm::HS256);
-            // The platform tokens may not always carry exp; be lenient.
-            validation.required_spec_claims.clear();
-            validation.validate_exp = false;
-
-            let data = decode::<Claims>(token, &key, &validation).map_err(|e| {
-                LeashError::ApiError {
-                    message: format!("JWT verification failed: {e}"),
-                    code: Some("invalid_token".to_string()),
-                }
+fn verify_hs256(header_b64: &str, payload_b64: &str, sig_b64: &str, secret: &str) -> Result<()> {
+    // HS256 = HMAC-SHA256 over `header_b64.payload_b64`, signature in base64url-no-pad.
+    let expected =
+        URL_SAFE_NO_PAD
+            .decode(sig_b64.as_bytes())
+            .map_err(|_| LeashError::Unauthorized {
+                message: "Invalid leash-auth cookie: signature not valid base64url.".to_string(),
             })?;
-            Ok(data.claims)
-        }
-        _ => {
-            // No secret configured — decode without verification.
-            let mut validation = Validation::new(Algorithm::HS256);
-            validation.insecure_disable_signature_validation();
-            validation.required_spec_claims.clear();
-            validation.validate_exp = false;
 
-            let key = DecodingKey::from_secret(b"");
-            let data = decode::<Claims>(token, &key, &validation).map_err(|e| {
-                LeashError::ApiError {
-                    message: format!("JWT decode failed: {e}"),
-                    code: Some("invalid_token".to_string()),
-                }
-            })?;
-            Ok(data.claims)
+    let signing_input = format!("{header_b64}.{payload_b64}");
+    let computed = hmac_sha256(secret.as_bytes(), signing_input.as_bytes());
+
+    if computed.len() != expected.len() {
+        return Err(LeashError::Unauthorized {
+            message: "Invalid leash-auth cookie: signature mismatch.".to_string(),
+        });
+    }
+    // Constant-time compare to avoid timing leaks.
+    let mut diff = 0u8;
+    for (a, b) in computed.iter().zip(expected.iter()) {
+        diff |= a ^ b;
+    }
+    if diff != 0 {
+        return Err(LeashError::Unauthorized {
+            message: "Invalid leash-auth cookie: signature mismatch.".to_string(),
+        });
+    }
+    Ok(())
+}
+
+// Minimal HMAC-SHA256 (RFC 2104) over SHA-256. Vendored to avoid pulling
+// `hmac` + `sha2` just for one decode call — the SDK already keeps deps thin.
+fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
+    const BLOCK: usize = 64;
+    let mut k = [0u8; BLOCK];
+    if key.len() > BLOCK {
+        let hashed = sha256(key);
+        k[..32].copy_from_slice(&hashed);
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+    let mut ipad = [0x36u8; BLOCK];
+    let mut opad = [0x5cu8; BLOCK];
+    for i in 0..BLOCK {
+        ipad[i] ^= k[i];
+        opad[i] ^= k[i];
+    }
+    let mut inner = Vec::with_capacity(BLOCK + msg.len());
+    inner.extend_from_slice(&ipad);
+    inner.extend_from_slice(msg);
+    let inner_hash = sha256(&inner);
+
+    let mut outer = Vec::with_capacity(BLOCK + 32);
+    outer.extend_from_slice(&opad);
+    outer.extend_from_slice(&inner_hash);
+    sha256(&outer)
+}
+
+// Tiny SHA-256 — pure Rust, no deps. Adapted from FIPS 180-4.
+fn sha256(msg: &[u8]) -> [u8; 32] {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+    let mut h = [
+        0x6a09e667u32, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+
+    let bit_len = (msg.len() as u64).wrapping_mul(8);
+    let mut padded = Vec::with_capacity(msg.len() + 64);
+    padded.extend_from_slice(msg);
+    padded.push(0x80);
+    while padded.len() % 64 != 56 {
+        padded.push(0);
+    }
+    padded.extend_from_slice(&bit_len.to_be_bytes());
+
+    for block in padded.chunks(64) {
+        let mut w = [0u32; 64];
+        for i in 0..16 {
+            w[i] = u32::from_be_bytes([
+                block[i * 4],
+                block[i * 4 + 1],
+                block[i * 4 + 2],
+                block[i * 4 + 3],
+            ]);
         }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+        let mut a = h[0];
+        let mut b = h[1];
+        let mut c = h[2];
+        let mut d = h[3];
+        let mut e = h[4];
+        let mut f = h[5];
+        let mut g = h[6];
+        let mut hh = h[7];
+
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ (!e & g);
+            let t1 = hh
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let t2 = s0.wrapping_add(maj);
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(t1);
+            d = c;
+            c = b;
+            b = a;
+            a = t1.wrapping_add(t2);
+        }
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+        h[5] = h[5].wrapping_add(f);
+        h[6] = h[6].wrapping_add(g);
+        h[7] = h[7].wrapping_add(hh);
+    }
+
+    let mut out = [0u8; 32];
+    for (i, word) in h.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Auth namespace — exposed off Leash::auth()
+// ---------------------------------------------------------------------------
+
+/// `leash.auth()` — non-throwing identity reads off the request that the
+/// client was constructed from.
+///
+/// The methods are `async` so the surface aligns with the rest of the SDK and
+/// stays flexible for a future remote-verify flow (today decode is purely
+/// in-memory).
+#[derive(Debug, Clone)]
+pub struct Auth {
+    pub(crate) cookie: Option<String>,
+}
+
+impl Auth {
+    /// Return the authenticated user, or `None` when not authenticated.
+    ///
+    /// Never errors on a missing/invalid cookie — handlers can branch
+    /// cleanly with `if user.is_none()`.
+    pub async fn user(&self) -> Result<Option<LeashUser>> {
+        let Some(cookie) = self.cookie.as_deref() else {
+            return Ok(None);
+        };
+        match decode_user(cookie) {
+            Ok(user) => Ok(Some(user)),
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// `true` when [`Self::user`] would return `Some(_)`.
+    pub async fn is_authenticated(&self) -> Result<bool> {
+        Ok(self.user().await?.is_some())
     }
 }
 
@@ -177,207 +335,152 @@ fn decode_jwt(token: &str) -> Result<Claims, LeashError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jsonwebtoken::{encode, EncodingKey, Header};
-    use serde::Serialize;
+    use serde_json::json;
     use std::sync::Mutex;
 
-    // Tests in this module mutate `LEASH_JWT_SECRET` — process-global state.
-    // Cargo runs tests in parallel by default, so without serialization, two
-    // tests can race on the env var (one removes it while another expects it
-    // set). Every test that reads or writes the secret takes this lock first.
+    // Process-global LEASH_JWT_SECRET — serialise tests that touch it.
     static ENV_GUARD: Mutex<()> = Mutex::new(());
 
-    #[derive(Serialize)]
-    struct TestClaims {
-        #[serde(rename = "userId")]
-        user_id: String,
-        email: String,
-        name: String,
-        picture: Option<String>,
+    fn b64(input: &[u8]) -> String {
+        URL_SAFE_NO_PAD.encode(input)
     }
 
-    fn make_token(claims: &TestClaims, secret: &str) -> String {
-        encode(
-            &Header::default(),
-            claims,
-            &EncodingKey::from_secret(secret.as_bytes()),
-        )
-        .unwrap()
-    }
-
-    fn sample_claims() -> TestClaims {
-        TestClaims {
-            user_id: "usr_123".to_string(),
-            email: "alice@example.com".to_string(),
-            name: "Alice".to_string(),
-            picture: Some("https://img.example.com/alice.png".to_string()),
-        }
+    fn make_token(payload: serde_json::Value, secret: &str) -> String {
+        let header = b64(br#"{"alg":"HS256","typ":"JWT"}"#);
+        let body = b64(payload.to_string().as_bytes());
+        let signing_input = format!("{header}.{body}");
+        let sig = hmac_sha256(secret.as_bytes(), signing_input.as_bytes());
+        let sig_b64 = b64(&sig);
+        format!("{header}.{body}.{sig_b64}")
     }
 
     #[test]
-    fn valid_token_returns_user() {
+    fn decode_user_no_secret_returns_user() {
         let _g = ENV_GUARD.lock().unwrap();
-        // Ensure no secret so we use insecure decode.
         std::env::remove_var("LEASH_JWT_SECRET");
-
-        let claims = sample_claims();
-        let token = make_token(&claims, "any-secret");
-        let header = format!("other=foo; leash-auth={token}; session=bar");
-
-        let user = get_leash_user(&header).unwrap();
-        assert_eq!(user.id, "usr_123");
-        assert_eq!(user.email, "alice@example.com");
-        assert_eq!(user.name, "Alice");
-        assert_eq!(
-            user.picture,
-            Some("https://img.example.com/alice.png".to_string())
+        let token = make_token(
+            json!({"userId":"u1","email":"a@b.c","name":"Al"}),
+            "anything",
         );
-    }
-
-    #[test]
-    fn missing_cookie_returns_error() {
-        let header = "session=abc; other=xyz";
-        let err = get_leash_user(header).unwrap_err();
-        assert!(err.to_string().contains("leash-auth cookie not found"));
-    }
-
-    #[test]
-    fn empty_header_returns_error() {
-        let err = get_leash_user("").unwrap_err();
-        assert!(err.to_string().contains("leash-auth cookie not found"));
-    }
-
-    #[test]
-    fn invalid_token_returns_error() {
-        let _g = ENV_GUARD.lock().unwrap();
-        std::env::remove_var("LEASH_JWT_SECRET");
-
-        let header = "leash-auth=not-a-jwt";
-        let err = get_leash_user(header).unwrap_err();
-        assert!(err.to_string().contains("JWT decode failed"));
-    }
-
-    #[test]
-    fn no_secret_decodes_without_verification() {
-        let _g = ENV_GUARD.lock().unwrap();
-        std::env::remove_var("LEASH_JWT_SECRET");
-
-        let claims = sample_claims();
-        // Sign with an arbitrary secret — should still decode fine
-        // when LEASH_JWT_SECRET is not set.
-        let token = make_token(&claims, "some-random-secret");
-        let user = get_leash_user_from_cookie(&token).unwrap();
-        assert_eq!(user.id, "usr_123");
-        assert_eq!(user.email, "alice@example.com");
-    }
-
-    #[test]
-    fn with_secret_verifies_signature() {
-        let _g = ENV_GUARD.lock().unwrap();
-        let secret = "test-secret-key";
-        std::env::set_var("LEASH_JWT_SECRET", secret);
-
-        let claims = sample_claims();
-        let token = make_token(&claims, secret);
-        let user = get_leash_user_from_cookie(&token).unwrap();
-        assert_eq!(user.id, "usr_123");
-
-        // Clean up.
-        std::env::remove_var("LEASH_JWT_SECRET");
-    }
-
-    #[test]
-    fn with_secret_rejects_wrong_signature() {
-        let _g = ENV_GUARD.lock().unwrap();
-        let secret = "correct-secret";
-        std::env::set_var("LEASH_JWT_SECRET", secret);
-
-        let claims = sample_claims();
-        let token = make_token(&claims, "wrong-secret");
-        let err = get_leash_user_from_cookie(&token).unwrap_err();
-        assert!(err.to_string().contains("JWT verification failed"));
-
-        // Clean up.
-        std::env::remove_var("LEASH_JWT_SECRET");
-    }
-
-    #[test]
-    fn get_leash_user_from_cookie_works_with_raw_token() {
-        let _g = ENV_GUARD.lock().unwrap();
-        std::env::remove_var("LEASH_JWT_SECRET");
-
-        let claims = sample_claims();
-        let token = make_token(&claims, "secret");
-        let user = get_leash_user_from_cookie(&token).unwrap();
-        assert_eq!(user.id, "usr_123");
-        assert_eq!(user.name, "Alice");
-    }
-
-    #[test]
-    fn picture_is_optional() {
-        let _g = ENV_GUARD.lock().unwrap();
-        std::env::remove_var("LEASH_JWT_SECRET");
-
-        let claims = TestClaims {
-            user_id: "usr_456".to_string(),
-            email: "bob@example.com".to_string(),
-            name: "Bob".to_string(),
-            picture: None,
-        };
-        let token = make_token(&claims, "s");
-        let user = get_leash_user_from_cookie(&token).unwrap();
-        assert_eq!(user.id, "usr_456");
+        let user = decode_user(&token).unwrap();
+        assert_eq!(user.id, "u1");
+        assert_eq!(user.email, "a@b.c");
+        assert_eq!(user.name, "Al");
         assert_eq!(user.picture, None);
     }
 
     #[test]
-    fn is_authenticated_returns_true_for_valid_cookie() {
+    fn decode_user_with_secret_verifies() {
+        let _g = ENV_GUARD.lock().unwrap();
+        std::env::set_var("LEASH_JWT_SECRET", "k");
+        let token = make_token(json!({"userId":"u1","email":"a@b","name":"x"}), "k");
+        let user = decode_user(&token).unwrap();
+        assert_eq!(user.id, "u1");
+        std::env::remove_var("LEASH_JWT_SECRET");
+    }
+
+    #[test]
+    fn decode_user_rejects_bad_signature() {
+        let _g = ENV_GUARD.lock().unwrap();
+        std::env::set_var("LEASH_JWT_SECRET", "correct");
+        let token = make_token(json!({"userId":"u1","email":"a@b","name":"x"}), "wrong");
+        let err = decode_user(&token).unwrap_err();
+        assert!(err.is_unauthorized());
+        std::env::remove_var("LEASH_JWT_SECRET");
+    }
+
+    #[test]
+    fn decode_user_rejects_expired_token() {
         let _g = ENV_GUARD.lock().unwrap();
         std::env::remove_var("LEASH_JWT_SECRET");
-
-        let claims = sample_claims();
-        let token = make_token(&claims, "any-secret");
-        let header = format!("leash-auth={token}");
-
-        assert!(is_authenticated(&header));
-    }
-
-    #[test]
-    fn is_authenticated_returns_false_for_missing_cookie() {
-        assert!(!is_authenticated("session=abc"));
-    }
-
-    #[test]
-    fn is_authenticated_from_cookie_returns_true_for_valid_token() {
-        let _g = ENV_GUARD.lock().unwrap();
-        std::env::remove_var("LEASH_JWT_SECRET");
-
-        let claims = sample_claims();
-        let token = make_token(&claims, "any-secret");
-
-        assert!(is_authenticated_from_cookie(&token));
-    }
-
-    #[test]
-    fn is_authenticated_from_cookie_returns_false_for_invalid_token() {
-        let _g = ENV_GUARD.lock().unwrap();
-        std::env::remove_var("LEASH_JWT_SECRET");
-
-        assert!(!is_authenticated_from_cookie("not-a-jwt"));
-    }
-
-    #[test]
-    fn parse_cookie_handles_edge_cases() {
-        // Cookie is the first in the header.
-        assert_eq!(parse_cookie("leash-auth=tok123", "leash-auth"), Some("tok123"));
-        // Cookie has spaces around semicolons.
-        assert_eq!(
-            parse_cookie("a=1 ; leash-auth=tok123 ; b=2", "leash-auth"),
-            Some("tok123")
+        let token = make_token(
+            json!({"userId":"u1","email":"a@b","name":"x","exp": 1}),
+            "k",
         );
-        // No match.
-        assert_eq!(parse_cookie("other=val", "leash-auth"), None);
-        // Similar prefix should not match.
-        assert_eq!(parse_cookie("leash-auth-extra=val", "leash-auth"), None);
+        let err = decode_user(&token).unwrap_err();
+        assert!(err.is_unauthorized());
+        assert!(matches!(err, LeashError::Unauthorized { ref message } if message.contains("expired")));
+    }
+
+    #[test]
+    fn decode_user_falls_back_to_sub_when_userid_absent() {
+        let _g = ENV_GUARD.lock().unwrap();
+        std::env::remove_var("LEASH_JWT_SECRET");
+        let token = make_token(json!({"sub":"u2","email":"x@y"}), "k");
+        let user = decode_user(&token).unwrap();
+        assert_eq!(user.id, "u2");
+        assert_eq!(user.email, "x@y");
+    }
+
+    #[test]
+    fn decode_user_errors_when_no_identifier() {
+        let _g = ENV_GUARD.lock().unwrap();
+        std::env::remove_var("LEASH_JWT_SECRET");
+        let token = make_token(json!({"email":"x@y","name":"n"}), "k");
+        let err = decode_user(&token).unwrap_err();
+        assert!(err.is_unauthorized());
+    }
+
+    #[test]
+    fn malformed_jwt_rejected() {
+        let _g = ENV_GUARD.lock().unwrap();
+        std::env::remove_var("LEASH_JWT_SECRET");
+        assert!(decode_user("not.a.jwt-tripartite").is_err());
+        assert!(decode_user("only-one-part").is_err());
+    }
+
+    #[tokio::test]
+    async fn auth_namespace_returns_none_when_no_cookie() {
+        let auth = Auth { cookie: None };
+        assert!(auth.user().await.unwrap().is_none());
+        assert!(!auth.is_authenticated().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn auth_namespace_returns_user_for_valid_cookie() {
+        let auth = {
+            let _g = ENV_GUARD.lock().unwrap();
+            std::env::remove_var("LEASH_JWT_SECRET");
+            let token = make_token(json!({"userId":"abc","email":"e","name":"n"}), "k");
+            Auth { cookie: Some(token) }
+            // Drop the guard before the await — the guard is non-Send and would
+            // otherwise be held across .await (clippy::await_holding_lock).
+        };
+        let user = auth.user().await.unwrap().unwrap();
+        assert_eq!(user.id, "abc");
+        assert!(auth.is_authenticated().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn auth_namespace_swallows_bad_cookie() {
+        let auth = {
+            let _g = ENV_GUARD.lock().unwrap();
+            std::env::remove_var("LEASH_JWT_SECRET");
+            Auth {
+                cookie: Some("garbage".into()),
+            }
+        };
+        // No error — just None.
+        assert!(auth.user().await.unwrap().is_none());
+        assert!(!auth.is_authenticated().await.unwrap());
+    }
+
+    #[test]
+    fn get_leash_user_reads_from_request() {
+        let _g = ENV_GUARD.lock().unwrap();
+        std::env::remove_var("LEASH_JWT_SECRET");
+        let token = make_token(json!({"userId":"u1","email":"e","name":"n"}), "k");
+        let req = http::Request::builder()
+            .header("cookie", format!("leash-auth={token}"))
+            .body(())
+            .unwrap();
+        let user = get_leash_user(&req).unwrap();
+        assert_eq!(user.id, "u1");
+    }
+
+    #[test]
+    fn is_authenticated_returns_false_for_no_cookie() {
+        let req = http::Request::builder().body(()).unwrap();
+        assert!(!is_authenticated(&req));
     }
 }
